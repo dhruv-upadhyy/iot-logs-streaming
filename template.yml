@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: IoT Core to Kinesis Firehose to S3
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for data storage
+  FirehoseStreamName:
+    Type: String
+    Description: Name of the Kinesis Firehose Delivery Stream
+  IoTRuleName:
+    Type: String
+    Description: Name of the IoT Core Rule
+  IoTTopicName:
+    Type: String
+    Description: Name of the IoT MQTT topic to subscribe to
+  GlueDatabaseName:
+    Type: String
+    Description: Name of the Glue Database
+  GlueTableName:
+    Type: String
+    Description: Name of the Glue Table
+  FirehoseBufferInterval:
+    Type: Number
+    Description: Buffer interval in seconds for Firehose (60-900)
+    MinValue: 60
+    MaxValue: 900
+  FirehoseBufferSize:
+    Type: Number
+    Description: Buffer size in MBs for Firehose (1-128)
+    MinValue: 1
+    MaxValue: 128
+
+Resources:
+  IoTFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Ref FirehoseStreamName
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt S3Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferInterval
+          SizeInMBs: !Ref FirehoseBufferSize
+        CompressionFormat: UNCOMPRESSED
+        Prefix: "iot-data/yyyymm=!{partitionKeyFromQuery:yyyymm}/thing_id=!{partitionKeyFromQuery:thing_id}/"
+        ErrorOutputPrefix: "errors/!{firehose:error-output-type}/"
+        RoleARN: !GetAtt FirehoseRole.Arn
+        DynamicPartitioningConfiguration:
+          Enabled: true
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: '{thing_id: .thing_id, yyyymm: (.ts | strftime("%Y%m"))}'
+            - Type: AppendDelimiterToRecord
+              Parameters:
+                - ParameterName: Delimiter
+                  ParameterValue: '\n'
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe: {}
+          SchemaConfiguration:
+            RoleARN: !GetAtt FirehoseRole.Arn
+            CatalogId: !Ref AWS::AccountId
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref GlueTableName
+
+  IoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Ref IoTRuleName
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: !Sub "SELECT * FROM '${IoTTopicName}'"
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref IoTFirehoseDeliveryStream
+              RoleArn: !GetAtt IoTRuleRole.Arn
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+        - PolicyName: FirehoseGluePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTableVersions
+                  - glue:GetTable
+                  - glue:GetDatabase
+                Resource: 
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}'
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRuleFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt IoTFirehoseDeliveryStream.Arn
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Database for IoT data
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Ref GlueTableName
+        Description: Table for IoT data
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "parquet"}
+        StorageDescriptor:
+          Columns:
+            - Name: thing_id
+              Type: string
+            - Name: ts
+              Type: timestamp
+          Location: !Sub 's3://${S3BucketName}/iot-data/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for data storage
+    Value: !Ref S3Bucket
+  FirehoseDeliveryStreamName:
+    Description: Name of the Kinesis Firehose Delivery Stream
+    Value: !Ref IoTFirehoseDeliveryStream
+  IoTRuleName:
+    Description: Name of the IoT Core Rule
+    Value: !Ref IoTRule
