@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: IoT Core to Kinesis Firehose to S3
+Description: IoT Core to Kinesis Firehose to S3 with Dynamic Partitioning
 
 Parameters:
   S3BucketName:
@@ -14,80 +14,26 @@ Parameters:
     Description: Name of the IoT Core Rule
   IoTTopicName:
     Type: String
-    Description: Name of the IoT MQTT topic to subscribe to
+    Description: Name of the IoT MQTT topic
+  DeviceTypes:
+    Type: CommaDelimitedList
+    Description: List of device types (comma-separated)
   GlueDatabaseName:
     Type: String
-    Description: Name of the Glue Database
-  GlueTableName:
-    Type: String
-    Description: Name of the Glue Table
+    Default: dummy-db
+    Description: Name of the Glue database
   FirehoseBufferInterval:
     Type: Number
-    Description: Buffer interval in seconds for Firehose (60-900)
+    Default: 300
     MinValue: 60
     MaxValue: 900
   FirehoseBufferSize:
     Type: Number
-    Description: Buffer size in MBs for Firehose (1-128)
+    Default: 5
     MinValue: 1
     MaxValue: 128
 
 Resources:
-  IoTFirehoseDeliveryStream:
-    Type: AWS::KinesisFirehose::DeliveryStream
-    Properties:
-      DeliveryStreamName: !Ref FirehoseStreamName
-      DeliveryStreamType: DirectPut
-      ExtendedS3DestinationConfiguration:
-        BucketARN: !GetAtt S3Bucket.Arn
-        BufferingHints:
-          IntervalInSeconds: !Ref FirehoseBufferInterval
-          SizeInMBs: !Ref FirehoseBufferSize
-        CompressionFormat: UNCOMPRESSED
-        Prefix: "iot-data/yyyymm=!{partitionKeyFromQuery:yyyymm}/thing_id=!{partitionKeyFromQuery:thing_id}/"
-        ErrorOutputPrefix: "errors/!{firehose:error-output-type}/"
-        RoleARN: !GetAtt FirehoseRole.Arn
-        DynamicPartitioningConfiguration:
-          Enabled: true
-        ProcessingConfiguration:
-          Enabled: true
-          Processors:
-            - Type: MetadataExtraction
-              Parameters:
-                - ParameterName: JsonParsingEngine
-                  ParameterValue: JQ-1.6
-                - ParameterName: MetadataExtractionQuery
-                  ParameterValue: '{thing_id: .thing_id, yyyymm: (.ts | strftime("%Y%m"))}'
-            - Type: AppendDelimiterToRecord
-              Parameters:
-                - ParameterName: Delimiter
-                  ParameterValue: '\n'
-        DataFormatConversionConfiguration:
-          Enabled: true
-          InputFormatConfiguration:
-            Deserializer:
-              OpenXJsonSerDe: {}
-          OutputFormatConfiguration:
-            Serializer:
-              ParquetSerDe: {}
-          SchemaConfiguration:
-            RoleARN: !GetAtt FirehoseRole.Arn
-            CatalogId: !Ref AWS::AccountId
-            DatabaseName: !Ref GlueDatabaseName
-            TableName: !Ref GlueTableName
-
-  IoTRule:
-    Type: AWS::IoT::TopicRule
-    Properties:
-      RuleName: !Ref IoTRuleName
-      TopicRulePayload:
-        RuleDisabled: false
-        Sql: !Sub "SELECT * FROM '${IoTTopicName}'"
-        Actions:
-          - Firehose:
-              DeliveryStreamName: !Ref IoTFirehoseDeliveryStream
-              RoleArn: !GetAtt IoTRuleRole.Arn
-
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -97,68 +43,6 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
     DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-
-  FirehoseRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: firehose.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: FirehoseS3Policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:AbortMultipartUpload
-                  - s3:GetBucketLocation
-                  - s3:GetObject
-                  - s3:ListBucket
-                  - s3:ListBucketMultipartUploads
-                  - s3:PutObject
-                Resource:
-                  - !Sub 'arn:aws:s3:::${S3BucketName}'
-                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
-        - PolicyName: FirehoseGluePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - glue:GetTableVersions
-                  - glue:GetTable
-                  - glue:GetDatabase
-                Resource: 
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}'
-
-  IoTRuleRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: iot.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: IoTRuleFirehosePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - firehose:PutRecord
-                  - firehose:PutRecordBatch
-                Resource: !GetAtt IoTFirehoseDeliveryStream.Arn
 
   GlueDatabase:
     Type: AWS::Glue::Database
@@ -166,38 +50,127 @@ Resources:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
         Name: !Ref GlueDatabaseName
-        Description: Database for IoT data
+        Description: IoT Data Database
 
-  GlueTable:
-    Type: AWS::Glue::Table
-    DependsOn: GlueDatabase
+GlueTables:
+  Type: AWS::CloudFormation::Stack
+  Properties:
+    TemplateBody: |
+      {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+          "GlueTable": {
+            "Type": "AWS::Glue::Table",
+            "Properties": {
+              "DatabaseName": "!Ref GlueDatabaseName",
+              "CatalogId": "!Ref AWS::AccountId",
+              "TableInput": {
+                "Name": "!Ref DeviceType",
+                "TableType": "EXTERNAL_TABLE",
+                "StorageDescriptor": {
+                  "Columns": [
+                    {"Name": "DeviceType", "Type": "string"},
+                    {"Name": "message_type", "Type": "string"},
+                    {"Name": "ts", "Type": "bigint"},
+                    {"Name": "data", "Type": "struct<temperature:double>"}
+                  ],
+                  "Location": !Sub "s3://${S3BucketName}/${DeviceType}/!{partitionKeyFromQuery:yyyy}/!{partitionKeyFromQuery:mm}/!{partitionKeyFromQuery:dd}/!{message_type}/",
+                  "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                  "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                  "SerdeInfo": {
+                    "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+                  }
+                },
+                "PartitionKeys": [
+                  {"Name": "yyyy", "Type": "string"},
+                  {"Name": "mm", "Type": "string"},
+                  {"Name": "dd", "Type": "string"},
+                  {"Name": "message_type", "Type": "string"}
+                ]
+              }
+            }
+          }
+        }
+      }
+    Parameters:
+      DeviceType: !Ref DeviceTypes
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
     Properties:
-      CatalogId: !Ref AWS::AccountId
-      DatabaseName: !Ref GlueDatabaseName
-      TableInput:
-        Name: !Ref GlueTableName
-        Description: Table for IoT data
-        TableType: EXTERNAL_TABLE
-        Parameters: {"classification": "parquet"}
-        StorageDescriptor:
-          Columns:
-            - Name: thing_id
-              Type: string
-            - Name: ts
-              Type: timestamp
-          Location: !Sub 's3://${S3BucketName}/iot-data/'
-          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
-          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
-          SerdeInfo:
-            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "firehose.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: FirehoseToS3GluePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub "arn:aws:s3:::${S3BucketName}/*"
+              - Effect: "Allow"
+                Action:
+                  - "glue:GetTable"
+                  - "glue:GetTableVersion"
+                  - "glue:GetTableVersionByName"
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+
+IoTFirehoseDeliveryStream:
+  Type: AWS::KinesisFirehose::DeliveryStream
+  Properties:
+    DeliveryStreamName: !Ref FirehoseStreamName
+    DeliveryStreamType: DirectPut
+    ExtendedS3DestinationConfiguration:
+      BucketARN: !GetAtt S3Bucket.Arn
+      BufferingHints:
+        IntervalInSeconds: !Ref FirehoseBufferInterval
+        SizeInMBs: !Ref FirehoseBufferSize
+      CompressionFormat: UNCOMPRESSED
+      Prefix: "{DeviceType}/!{partitionKeyFromQuery:yyyy}/!{partitionKeyFromQuery:mm}/!{partitionKeyFromQuery:dd}/!{message_type}/"
+      ErrorOutputPrefix: "errors/!{firehose:error-output-type}/"
+      RoleARN: !GetAtt FirehoseRole.Arn
+      DynamicPartitioningConfiguration:
+        Enabled: true
+      ProcessingConfiguration:
+        Enabled: true
+        Processors:
+          - Type: MetadataExtraction
+            Parameters:
+              - ParameterName: JsonParsingEngine
+                ParameterValue: JQ-1.6
+              - ParameterName: MetadataExtractionQuery
+                ParameterValue: '{DeviceType: .DeviceType, message_type: .message_type, yyyy: (.ts | strftime("%Y")), mm: (.ts | strftime("%m")), dd: (.ts | strftime("%d"))}'
+          - Type: AppendDelimiterToRecord
+            Parameters:
+              - ParameterName: Delimiter
+                ParameterValue: '\n'
+      DataFormatConversionConfiguration:
+        Enabled: true
+        InputFormatConfiguration:
+          Deserializer:
+            OpenXJsonSerDe: {}
+        OutputFormatConfiguration:
+          Serializer:
+            ParquetSerDe: {}
+        SchemaConfiguration:
+          RoleARN: !GetAtt FirehoseRole.Arn
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          TableName: !Ref DeviceType
 
 Outputs:
-  S3BucketName:
-    Description: Name of the S3 bucket for data storage
-    Value: !Ref S3Bucket
-  FirehoseDeliveryStreamName:
-    Description: Name of the Kinesis Firehose Delivery Stream
-    Value: !Ref IoTFirehoseDeliveryStream
-  IoTRuleName:
-    Description: Name of the IoT Core Rule
-    Value: !Ref IoTRule
+  FirehoseStream:
+    Description: The Kinesis Firehose Stream Name
+    Value: !Ref FirehoseStreamName
+  IoTIoTRuleRule:
+    Description: IoT Core Rule Name
+    Value: !Ref IoTRuleName
+  GlueDatabase:
+    Description: Glue Database Name
+    Value: !Ref GlueDatabaseName
