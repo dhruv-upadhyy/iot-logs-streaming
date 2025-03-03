@@ -1,19 +1,10 @@
-version = 0.1
-[default]
-[default.deploy]
-[default.deploy.parameters]
-stack_name = "iot-firehose-s3-stack"
-s3_prefix = "iot-firehose-s3-stack"
-region = "ap-south-1"
-confirm_changeset = true
-capabilities = ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"]
-parameter_overrides = [
-  "S3BucketName=mys3iotdatabucket",
-  "FirehoseStreamName=myiotfirehosestream",
-  "IoTTopicName=iot/topic",
-  "IoTRuleName=myiotrule1",
-  "GlueDatabaseName=myglueiotdatabase",
-  "GlueTableName=myglueiottable",
-  "FirehoseBufferInterval=60",
-  "FirehoseBufferSize=64"
-]
+{
+  "S3BucketName": "your-s3-bucket-name",
+  "FirehoseStreamName": "your-firehose-stream-name",
+  "IoTRuleName": "your-iot-core-rule-name",
+  "IoTTopicName": "your-iot-mqtt-topic-name",
+  "DeviceTypes": ["DeviceType1", "DeviceType2", "DeviceType3"],
+  "GlueDatabaseName": "dummy-db",
+  "FirehoseBufferInterval": 300,
+  "FirehoseBufferSize": 5
+}
